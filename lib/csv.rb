@@ -99,6 +99,7 @@ require_relative "csv/input_record_separator"
 require_relative "csv/parser"
 require_relative "csv/row"
 require_relative "csv/table"
+require_relative "csv/type_analyzer"
 require_relative "csv/writer"
 
 # == \CSV
