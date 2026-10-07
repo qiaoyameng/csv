@@ -1,0 +1,29 @@
+====== Option +spreadsheet_header_text_policy+
+
+Specifies the spreadsheet text policy applied to the header row written
+via option +write_headers+, separately from the policy applied to data
+rows. Accepts the same values as option +spreadsheet_text_policy+.
+
+Default value:
+  CSV::DEFAULT_OPTIONS.fetch(:spreadsheet_header_text_policy) # => nil
+
+When this option is +nil+ (the default), the header row uses the policy
+given by option +spreadsheet_text_policy+; pass +false+ to explicitly
+leave the header row unchecked while checking data rows.
+
+Header row checked via the data policy by default:
+  str = CSV.generate(headers: ["=name", "val"], write_headers: true,
+                     spreadsheet_text_policy: :prefix) do |csv|
+    csv << ["=x", 1]
+  end
+  str # => "'=name,val\n'=x,1\n"
+
+Header row handled separately:
+  str = CSV.generate(headers: ["=name", "val"], write_headers: true,
+                     spreadsheet_text_policy: :prefix,
+                     spreadsheet_header_text_policy: false) do |csv|
+    csv << ["=x", 1]
+  end
+  str # => "=name,val\n'=x,1\n"
+
+See {Option +spreadsheet_text_policy+}[#class-CSV-label-Option+spreadsheet_text_policy].

@@ -18,11 +18,13 @@ class CSV
       @options = options
       @lineno = 0
       @fields_converter = nil
+      @spreadsheet_text_policy = @options[:spreadsheet_header_text_policy]
       prepare
       if @options[:write_headers] and @headers
         self << @headers
       end
       @fields_converter = @options[:fields_converter]
+      @spreadsheet_text_policy = @options[:spreadsheet_text_policy]
     end
 
     #
@@ -41,6 +43,14 @@ class CSV
 
       if @fields_converter
         row = @fields_converter.convert(row, nil, lineno)
+      end
+
+      if @spreadsheet_text_policy
+        i = -1
+        row = row.collect do |field|
+          i += 1
+          @spreadsheet_text_policy.apply(field, lineno, i + 1)
+        end
       end
 
       i = -1

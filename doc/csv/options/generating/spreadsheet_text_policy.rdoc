@@ -1,0 +1,53 @@
+====== Option +spreadsheet_text_policy+
+
+Specifies the policy applied to \String fields that a spreadsheet
+application may interpret as a formula instead of as text
+(CSV formula injection).
+
+The policy is applied to each written row after option
++write_converters+ has run and before \CSV quoting, so neither option
++force_quotes+ nor output encodings can bypass it. Only \String fields
+are checked: a \Numeric value such as +-5+ is written as-is, while a
+user supplied \String such as <tt>"-5"</tt> is treated as text that a
+spreadsheet may misinterpret.
+
+Possible values:
+- +nil+ or +false+ (default): no checking; output is unchanged.
+- <tt>:prefix</tt>: prepend an apostrophe to suspicious fields so a
+  spreadsheet reads them as explicit text. A field that already starts
+  with the prefix is left unchanged.
+- <tt>:reject</tt>: raise CSV::SpreadsheetTextError for suspicious
+  fields. The error message includes the 1-based column number and the
+  logical row number, but not the field value.
+- A \Hash of keywords for CSV::SpreadsheetTextPolicy.new, e.g.
+  <tt>{action: :prefix, prefix: "'"}</tt> or
+  <tt>{action: :reject, expose_value: true}</tt>.
+- A CSV::SpreadsheetTextPolicy instance.
+
+Default value:
+  CSV::DEFAULT_OPTIONS.fetch(:spreadsheet_text_policy) # => nil
+
+With the default (disabled) policy:
+  str = CSV.generate_line(["=1+1", "plain"])
+  str # => "=1+1,plain\n"
+
+With the <tt>:prefix</tt> policy:
+  str = CSV.generate_line(["=1+1", "plain", -5, "-5"],
+                          spreadsheet_text_policy: :prefix)
+  str # => "'=1+1,plain,-5,'-5\n"
+
+With the <tt>:reject</tt> policy:
+  begin
+    CSV.generate_line(["ok", "=1+1"], spreadsheet_text_policy: :reject)
+  rescue CSV::SpreadsheetTextError => error
+    error.message # => "field looks like a spreadsheet formula in column 2 on line 1."
+  end
+
+A field is considered suspicious when, after ignoring the checked
+leading whitespace (space, tab) and control (carriage return, line feed)
+characters, it begins with <tt>=</tt>, <tt>+</tt>, <tt>-</tt>, or
+<tt>@</tt>, or when it begins with a checked control character.
+See CSV::SpreadsheetTextPolicy for the exact checked character sets;
+they do not claim to cover every spreadsheet application.
+
+See also {Option +spreadsheet_header_text_policy+}[#class-CSV-label-Option+spreadsheet_header_text_policy].

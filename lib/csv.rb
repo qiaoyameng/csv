@@ -97,6 +97,7 @@ require "stringio"
 require_relative "csv/fields_converter"
 require_relative "csv/input_record_separator"
 require_relative "csv/parser"
+require_relative "csv/spreadsheet_text_policy"
 require_relative "csv/row"
 require_relative "csv/table"
 require_relative "csv/writer"
@@ -339,6 +340,8 @@ require_relative "csv/writer"
 #     write_converters:   nil,
 #     write_nil_value:    nil,
 #     write_empty_value:  "",
+#     spreadsheet_text_policy:        nil,
+#     spreadsheet_header_text_policy: nil,
 #   }
 #
 # ==== Options for Parsing
@@ -408,6 +411,10 @@ require_relative "csv/writer"
 # - +write_converters+: Specifies the field converters to be used in writing.
 # - +write_nil_value+: Specifies the object that is to be substituted for each +nil+-valued field.
 # - +write_empty_value+: Specifies the object that is to be substituted for each empty field.
+# - +spreadsheet_text_policy+: Specifies how fields that a spreadsheet
+#   application may interpret as a formula are handled when writing.
+# - +spreadsheet_header_text_policy+: Specifies the spreadsheet text
+#   policy for the written header row, separately from data rows.
 #
 # :include: ../doc/csv/options/common/row_sep.rdoc
 #
@@ -426,6 +433,10 @@ require_relative "csv/writer"
 # :include: ../doc/csv/options/generating/write_nil_value.rdoc
 #
 # :include: ../doc/csv/options/generating/write_empty_value.rdoc
+#
+# :include: ../doc/csv/options/generating/spreadsheet_text_policy.rdoc
+#
+# :include: ../doc/csv/options/generating/spreadsheet_header_text_policy.rdoc
 #
 # === \CSV with Headers
 #
@@ -977,6 +988,8 @@ class CSV
     write_converters:   nil,
     write_nil_value:    nil,
     write_empty_value:  "",
+    spreadsheet_text_policy:        nil,
+    spreadsheet_header_text_policy: nil,
   }.freeze
 
   class << self
@@ -2056,7 +2069,9 @@ class CSV
                  quote_empty: true,
                  write_converters: nil,
                  write_nil_value: nil,
-                 write_empty_value: "")
+                 write_empty_value: "",
+                 spreadsheet_text_policy: nil,
+                 spreadsheet_header_text_policy: nil)
     raise ArgumentError.new("Cannot parse nil as CSV") if data.nil?
 
     if data.is_a?(String)
@@ -2121,6 +2136,11 @@ class CSV
       row_separator: row_sep,
       quote_character: quote_char,
       quote_empty: quote_empty,
+      spreadsheet_text_policy:
+        SpreadsheetTextPolicy.resolve(spreadsheet_text_policy),
+      spreadsheet_header_text_policy:
+        resolve_spreadsheet_header_text_policy(spreadsheet_header_text_policy,
+                                               spreadsheet_text_policy),
     }
 
     @writer = nil
@@ -2954,6 +2974,14 @@ class CSV
   def writer_options
     @writer_options.merge(header_fields_converter: header_fields_converter,
                           fields_converter: writer_fields_converter)
+  end
+
+  # Option +spreadsheet_header_text_policy+ defaults to the value of
+  # option +spreadsheet_text_policy+; pass +false+ to explicitly disable
+  # the policy for the written header row only.
+  def resolve_spreadsheet_header_text_policy(header_policy, data_policy)
+    header_policy = data_policy if header_policy.nil?
+    SpreadsheetTextPolicy.resolve(header_policy)
   end
 end
 
