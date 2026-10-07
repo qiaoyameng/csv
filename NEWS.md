@@ -1,5 +1,19 @@
 # News
 
+## Unreleased
+
+### New features
+
+  * Added `CSV::SegmentedReader`: reads a single stream that concatenates
+    sections with different headers separated by caller defined segment
+    markers. Markers are recognized only on complete record boundaries (a
+    marker appearing inside a quoted multi-line field is ignored). Each
+    segment rebuilds its header converter and column mapping, yields rows
+    tagged with the segment number, in-segment line number and global line
+    number, keeps repeated headers by position, and can project rows onto a
+    caller supplied unified set of output columns with a distinct
+    `CSV::MissingValue` sentinel for columns the segment does not provide.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements

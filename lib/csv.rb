@@ -100,6 +100,7 @@ require_relative "csv/parser"
 require_relative "csv/row"
 require_relative "csv/table"
 require_relative "csv/writer"
+require_relative "csv/segmented_reader"
 
 # == \CSV
 #
@@ -864,6 +865,17 @@ class CSV
     def initialize(encoding, line_number)
       @encoding = encoding
       super("Invalid byte sequence in #{encoding}", line_number)
+    end
+  end
+
+  # The error raised by a CSV::SegmentedReader when a segment is started by a
+  # segment marker but has no usable header record: the next complete record
+  # is another segment marker or end of input.
+  class MissingHeaderError < MalformedCSVError
+    attr_reader :segment
+    def initialize(message, line_number, segment)
+      @segment = segment
+      super(message, line_number)
     end
   end
 
