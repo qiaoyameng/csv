@@ -1,0 +1,19 @@
+====== Option +header_spreadsheet_text_policy+
+
+Specifies how the writer treats dangerous spreadsheet text in the
+header row written by option +write_headers+. It accepts the same
+values as option +spreadsheet_text_policy+ and is configured
+separately, so headers can be checked with a different (or no) policy
+than data rows.
+
+Default value (checking disabled):
+  CSV::DEFAULT_OPTIONS.fetch(:header_spreadsheet_text_policy) # => nil
+
+Example: reject dangerous text in data rows, but only prefix it in the
+header row:
+  CSV.generate(headers: ['=name', 'value'], write_headers: true,
+               spreadsheet_text_policy: :reject,
+               header_spreadsheet_text_policy: :prefix) do |csv|
+    csv << ['alice', 1]
+  end
+  # => "'=name,value\nalice,1\n"

@@ -2,6 +2,7 @@
 
 require_relative "input_record_separator"
 require_relative "row"
+require_relative "spreadsheet_text_policy"
 
 class CSV
   # Note: Don't use this class directly. This is an internal class.
@@ -18,9 +19,15 @@ class CSV
       @options = options
       @lineno = 0
       @fields_converter = nil
+      @writing_headers = false
       prepare
       if @options[:write_headers] and @headers
-        self << @headers
+        begin
+          @writing_headers = true
+          self << @headers
+        ensure
+          @writing_headers = false
+        end
       end
       @fields_converter = @options[:fields_converter]
     end
@@ -41,6 +48,16 @@ class CSV
 
       if @fields_converter
         row = @fields_converter.convert(row, nil, lineno)
+      end
+
+      spreadsheet_text_policy = @writing_headers ?
+                                @header_spreadsheet_text_policy :
+                                @spreadsheet_text_policy
+      if spreadsheet_text_policy
+        lineno = @lineno
+        row = row.each_with_index.collect do |field, i|
+          spreadsheet_text_policy.apply(field, i, lineno)
+        end
       end
 
       i = -1
@@ -71,7 +88,17 @@ class CSV
 
       prepare_header
       prepare_format
+      prepare_spreadsheet_text_policy
       prepare_output
+    end
+
+    def prepare_spreadsheet_text_policy
+      @spreadsheet_text_policy =
+        SpreadsheetTextPolicy.build(@options[:spreadsheet_text_policy],
+                                    ":spreadsheet_text_policy")
+      @header_spreadsheet_text_policy =
+        SpreadsheetTextPolicy.build(@options[:header_spreadsheet_text_policy],
+                                    ":header_spreadsheet_text_policy")
     end
 
     def prepare_header
