@@ -2985,5 +2985,6 @@ def CSV(*args, **options, &block)
 end
 
 require_relative "csv/version"
+require_relative "csv/segmented_reader"
 require_relative "csv/core_ext/array"
 require_relative "csv/core_ext/string"
