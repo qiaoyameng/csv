@@ -332,6 +332,9 @@ require_relative "csv/writer"
 #     nil_value:          nil,
 #     empty_value:        "",
 #     strip:              false,
+#     recover:            false,
+#     max_failure_bytes:  4096,
+#     resync_budget:      nil,
 #     # For generating.
 #     write_headers:      nil,
 #     quote_empty:        true,
@@ -363,6 +366,12 @@ require_relative "csv/writer"
 #   then an +ArgumentError+ exception will be raised.
 # - +liberal_parsing+: Specifies whether \CSV should attempt to parse
 #   non-compliant data.
+# - +recover+: Specifies whether bad records are retained as CSV::Failure
+#   objects and parsing continues when a record boundary is still certain.
+# - +max_failure_bytes+: Specifies how many raw bytes of a failed record
+#   are retained on a CSV::Failure.
+# - +resync_budget+: Specifies the byte scan limit for locating a failed
+#   record's boundary; exceeding it is an unrecoverable error.
 # - +nil_value+: Specifies the object that is to be substituted for each null (no-text) field.
 # - +empty_value+: Specifies the object that is to be substituted for each empty field.
 #
@@ -391,6 +400,8 @@ require_relative "csv/writer"
 # :include: ../doc/csv/options/parsing/strip.rdoc
 #
 # :include: ../doc/csv/options/parsing/liberal_parsing.rdoc
+#
+# :include: ../doc/csv/options/parsing/recover.rdoc
 #
 # :include: ../doc/csv/options/parsing/nil_value.rdoc
 #
@@ -867,6 +878,8 @@ class CSV
     end
   end
 
+  require_relative "csv/failure"
+
   #
   # A FieldInfo Struct contains details about a field's position in the data
   # source it was read from.  CSV will pass this Struct to some blocks that make
@@ -970,6 +983,10 @@ class CSV
     nil_value:          nil,
     empty_value:        "",
     strip:              false,
+    # For recovery parsing.
+    recover:            false,
+    max_failure_bytes:  4096,
+    resync_budget:      nil,
     # For generating.
     write_headers:      nil,
     quote_empty:        true,
@@ -1836,6 +1853,70 @@ class CSV
     end
 
     # :call-seq:
+    #   CSV.import(string_or_io, **options) -> [rows, failures]
+    #   CSV.import(string_or_io, **options) {|row_or_failure| ... } -> csv
+    #
+    # Parses the given data in recovery mode, which is suited for batch
+    # imports that must keep going past bad records.
+    #
+    # Successfully parsed records are yielded/returned as usual.  Records
+    # whose fields are malformed but whose boundary can still be determined
+    # are yielded/returned as CSV::Failure objects carrying the raw byte
+    # range, the logical line number and the error reason; parsing then
+    # continues at the next record.  Newlines inside a properly quoted
+    # field are never mistaken for a record boundary.
+    #
+    # Parsing stops with CSV::UnrecoverableMalformedCSVError when the
+    # boundary cannot be determined at all, namely for an unclosed quoted
+    # field or when the +resync_budget+ scan limit is exceeded.
+    #
+    # Relevant options (in addition to the usual parsing options):
+    # - <tt>:max_failure_bytes</tt>: upper bound of raw bytes retained on
+    #   each CSV::Failure (defaults to 4096); longer raw data is truncated
+    #   and flagged with CSV::Failure#truncated?.
+    # - <tt>:resync_budget</tt>: maximum number of bytes scanned while
+    #   searching for a record boundary after an error; +nil+ (the default)
+    #   means no limit.
+    #
+    # Without a block, returns a two element Array of successful rows and
+    # the collected CSV::Failure objects:
+    #   data = "good,1\nbad\"quote,2\nafter,3\n"
+    #   rows, failures = CSV.import(data)
+    #   rows      # => [["good", "1"], ["after", "3"]]
+    #   failures  # => [#<CSV::Failure ...>]
+    #
+    # With a block, each row or CSV::Failure is passed to the block and the
+    # CSV instance is returned (use CSV#failures to collect failures):
+    #   CSV.import(data) do |record|
+    #     case record
+    #     when CSV::Failure then review(record)
+    #     else import_record(record)
+    #     end
+    #   end
+    #
+    # To import from a file path, use CSV.open or CSV.foreach with
+    # <tt>recover: true</tt>.
+    def import(data, **options, &block)
+      options[:recover] = true
+      csv = new(data, **options)
+
+      if block_given?
+        csv.each(&block)
+        return csv
+      end
+
+      begin
+        rows = []
+        csv.each do |record|
+          rows << record unless record.is_a?(Failure)
+        end
+        [rows, csv.failures]
+      ensure
+        csv.close
+      end
+    end
+
+    # :call-seq:
     #   CSV.parse_line(string) -> new_array or nil
     #   CSV.parse_line(io) -> new_array or nil
     #   CSV.parse_line(string, **options) -> new_array or nil
@@ -2053,11 +2134,24 @@ class CSV
                  nil_value: nil,
                  empty_value: "",
                  strip: false,
+                 recover: false,
+                 max_failure_bytes: 4096,
+                 resync_budget: nil,
                  quote_empty: true,
                  write_converters: nil,
                  write_nil_value: nil,
                  write_empty_value: "")
     raise ArgumentError.new("Cannot parse nil as CSV") if data.nil?
+
+    if max_failure_bytes && !(max_failure_bytes.is_a?(Integer) &&
+                              max_failure_bytes >= 0)
+      raise ArgumentError,
+            ":max_failure_bytes has to be a non-negative Integer or nil"
+    end
+    if resync_budget && !(resync_budget.is_a?(Integer) && resync_budget > 0)
+      raise ArgumentError,
+            ":resync_budget has to be a positive Integer or nil"
+    end
 
     if data.is_a?(String)
       if encoding
@@ -2108,6 +2202,9 @@ class CSV
       nil_value: nil_value,
       empty_value: empty_value,
       strip: strip,
+      recover: recover,
+      max_failure_bytes: max_failure_bytes,
+      resync_budget: resync_budget,
     }
     @parser = nil
 
@@ -2674,7 +2771,25 @@ class CSV
   #     p row
   #   end
   def each(&block)
-    parser.parse(&block)
+    return to_enum unless block_given?
+
+    if parser_options[:recover]
+      @failures ||= []
+      parser.parse do |row_or_failure|
+        if row_or_failure.is_a?(CSV::Failure)
+          @failures << row_or_failure
+        end
+        yield(row_or_failure)
+      end
+    else
+      parser.parse(&block)
+    end
+  end
+
+  # Returns the CSV::Failure records collected so far while parsing in
+  # recovery mode.  Returns an empty Array when not in recovery mode.
+  def failures
+    @failures || []
   end
 
   # :call-seq:

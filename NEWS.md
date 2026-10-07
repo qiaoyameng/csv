@@ -1,5 +1,20 @@
 # News
 
+## Unreleased
+
+### Improvements
+
+  * Added recovery mode for batch imports (`recover: true` /
+    `CSV.import`). Malformed records whose boundary can still be
+    determined are returned as `CSV::Failure` objects (with logical
+    line number, raw byte range, error reason and truncated raw bytes
+    limited by `max_failure_bytes`) and parsing continues with the next
+    record; newlines inside valid quoted fields are never treated as
+    boundaries. An unclosed quoted field, or exceeding the
+    `resync_budget` scan limit, is reported as
+    `CSV::UnrecoverableMalformedCSVError` and stops parsing. Converter
+    errors only affect the current record.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements

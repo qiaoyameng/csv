@@ -1,0 +1,48 @@
+====== Option +recover+
+
+Specifies whether parsing should run in recovery mode.
+Recovery mode is useful for batch imports that want to keep
+malformed records for manual review while continuing with
+the records that follow.
+
+Default value:
+  CSV::DEFAULT_OPTIONS.fetch(:recover) # => false
+
+In recovery mode, successfully parsed records are returned
+as usual, while a record with malformed fields is returned
+as a CSV::Failure object, which retains:
+- The record's logical line number (CSV::Failure#lineno),
+  counting a multi-line quoted record as one record.
+- The record's byte range in the original input
+  (CSV::Failure#byte_range).
+- The record's raw bytes (CSV::Failure#raw), limited by
+  +max_failure_bytes+ and flagged with CSV::Failure#truncated?
+  when truncated.
+- The error reason (CSV::Failure#reason).
+
+Parsing does not simply jump to the next physical newline,
+because that newline may be inside a valid quoted field.
+A field error is skipped only when a complete record
+boundary can still be determined.  An unclosed quoted field,
+or exceeding the +resync_budget+ scan limit, makes the
+boundary undetermined; parsing then stops by raising
+CSV::UnrecoverableMalformedCSVError.
+
+The easiest way to use recovery mode is CSV.import:
+  data = "good,1\nbad\"quote,2\nafter,3\n"
+  rows, failures = CSV.import(data)
+  rows      # => [["good", "1"], ["after", "3"]]
+  failure = failures.first
+  failure.lineno       # => 2
+  failure.raw          # => "bad\"quote,2\n"
+  failure.byte_range   # => 7...14
+  failure.reason       # => "Illegal quoting in line 2."
+
+You can also pass <tt>recover: true</tt> to CSV.new,
+CSV.foreach or CSV.open and iterate directly; CSV::Failure
+objects are yielded in record order.
+
+An exception raised by a field converter affects only the
+record being converted: that record is reported as a
+CSV::Failure and previously converted records are not
+converted again.
