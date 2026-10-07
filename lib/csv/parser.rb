@@ -39,6 +39,28 @@ class CSV
     class UnexpectedError < StandardError
     end
 
+    # Internal control-flow signals used by recovery mode. They carry the
+    # reason for a bad record and never escape Parser#parse.
+    class RecoverableFieldError < StandardError
+      attr_reader :reason
+      def initialize(reason)
+        @reason = reason
+        super(reason)
+      end
+    end
+
+    class UnrecoverableFieldError < StandardError
+      attr_reader :reason
+      def initialize(reason)
+        @reason = reason
+        super(reason)
+      end
+    end
+
+    # Internal sentinel meaning "the header row was consumed but must not be
+    # yielded" (headers are in use but +return_headers+ is false).
+    HEADER_CONSUMED = Object.new.freeze
+
     #
     # CSV::Scanner receives a CSV output, scans it and return the content.
     # It also controls the life cycle of the object with its methods +keep_start+,
@@ -81,6 +103,10 @@ class CSV
 
       def keep_drop
         @keeps.pop
+      end
+
+      def clear_keeps
+        @keeps.clear
       end
     end
 
@@ -422,26 +448,41 @@ class CSV
 
       begin
         @scanner ||= build_scanner
-        __send__(@parse_method, &block)
+        if @recovery and @encoding_failure_string
+          emit_encoding_failure_from_string(&block)
+          return
+        end
+        if @recovery
+          catch(:stop_recovery) do
+            __send__(@parse_method, &block)
+          end
+        else
+          __send__(@parse_method, &block)
+        end
       rescue InvalidEncoding
-        if @scanner
-          ignore_broken_line
-          lineno = @lineno
+        if @recovery
+          lineno = error_lineno
+          error = InvalidEncodingError.new(@encoding, lineno)
+          emit_encoding_failure(error, &block)
         else
-          lineno = @lineno + 1
+          ignore_broken_line if @scanner
+          lineno = error_lineno
+          error = InvalidEncodingError.new(@encoding, lineno)
+          raise error
         end
-        raise InvalidEncodingError.new(@encoding, lineno)
       rescue UnexpectedError => error
-        if @scanner
-          ignore_broken_line
-          lineno = @lineno
-        else
-          lineno = @lineno + 1
-        end
+        lineno = error_lineno
         message = "This should not be happen: #{error.message}: "
         message += "Please report this to https://github.com/ruby/csv/issues"
-        raise MalformedCSVError.new(message, lineno)
+        raise MalformedCSVError.new(message, lineno) unless @recovery
+        emit_record_failure(UnrecoverableFieldError.new(message),
+                            :unrecoverable,
+                            &block)
       end
+    end
+
+    def error_lineno
+      @scanner ? @lineno : @lineno + 1
     end
 
     def eof?
@@ -492,6 +533,9 @@ class CSV
       @skip_blanks = @options[:skip_blanks]
       @fields_converter = @options[:fields_converter]
       @header_fields_converter = @options[:header_fields_converter]
+      @recovery = @options[:recovery]
+      @max_retained_bytes = @options[:max_retained_bytes]
+      @recovery_scan_budget = @options[:recovery_scan_budget]
     end
 
     def prepare_quote_character
@@ -862,6 +906,26 @@ class CSV
       SCANNER_TEST_CHUNK_SIZE_NAME = "CSV_PARSER_SCANNER_TEST_CHUNK_SIZE"
       SCANNER_TEST_CHUNK_SIZE_VALUE = ENV[SCANNER_TEST_CHUNK_SIZE_NAME]
       def build_scanner
+        if @recovery
+          string = @samples.join
+          @samples.clear
+          if @input.is_a?(StringIO)
+            string << @input.read
+          else
+            while chunk = @input.gets(@row_separator, 1024 * 1024)
+              string << chunk
+            end
+          end
+          if !string.valid_encoding?
+            index = string.lines(@row_separator).index { |line| !line.valid_encoding? }
+            if index
+              @encoding_failure_string = string
+              @encoding_failure_index = index
+              return nil
+            end
+          end
+          return Scanner.new(string) unless string.empty?
+        end
         inputs = @samples.collect do |sample|
           UnoptimizedStringIO.new(sample)
         end
@@ -885,7 +949,20 @@ class CSV
     else
       def build_scanner
         string = nil
-        if @samples.empty? and @input.is_a?(StringIO)
+        if @recovery
+          # Recovery needs stable absolute byte offsets for failure items and
+          # has to re-scan bad records, so it materializes the whole input.
+          string = @samples.join
+          @samples.clear
+          if @input.is_a?(StringIO)
+            string << @input.read
+          else
+            while chunk = @input.gets(@row_separator, 1024 * 1024)
+              string << chunk
+            end
+          end
+          string = nil if string.empty?
+        elsif @samples.empty? and @input.is_a?(StringIO)
           string = @input.read
         elsif @samples.size == 1 and Parser.eof?(@input)
           string = @samples[0]
@@ -896,10 +973,15 @@ class CSV
               !line.valid_encoding?
             end
             if index
-              raise InvalidEncodingError.new(@encoding, @lineno + index + 1)
+              if @recovery
+                @encoding_failure_string = string
+                @encoding_failure_index = index
+              else
+                raise InvalidEncodingError.new(@encoding, @lineno + index + 1)
+              end
             end
           end
-          Scanner.new(string)
+          Scanner.new(string) unless @encoding_failure_string
         else
           inputs = @samples.collect do |sample|
             StringIO.new(sample)
@@ -942,38 +1024,54 @@ class CSV
     def validate_field_size(field)
       return unless @max_field_size
       return if field.size <= @max_field_size
-      ignore_broken_line
       message = "Field size exceeded: #{field.size} > #{@max_field_size}"
-      raise MalformedCSVError.new(message, @lineno)
+      field_error!(:recoverable, message)
     end
 
     def parse_no_quote(&block)
       @scanner.each_line(@row_separator) do |line|
         next if @skip_lines and skip_line?(line)
         original_line = line
-        line = line.delete_suffix(@row_separator)
-
-        if line.empty?
+        content = line.delete_suffix(@row_separator)
+        if content.empty?
           next if @skip_blanks
-          row = []
+          @record_start_pos = @scanner.pos - line.bytesize if @recovery
+          @record_end_pos = @scanner.pos if @recovery
+          @last_line = original_line
+          emit_row([], &block)
+        elsif @recovery
+          @record_start_pos = @scanner.pos - line.bytesize
+          @record_end_pos = @scanner.pos
+          begin
+            row = parse_no_quote_content(content)
+            @last_line = original_line
+            emit_row(row, &block)
+          rescue RecoverableFieldError => error
+            emit_record_failure(error, :field_error, &block)
+          rescue UnrecoverableFieldError => error
+            emit_record_failure(error, :unrecoverable, &block)
+            return
+          end
         else
-          line = strip_value(line)
-          row = line.split(@split_column_separator, -1)
-          if @max_field_size
-            row.each do |column|
-              validate_field_size(column)
-            end
-          end
-          n_columns = row.size
-          i = 0
-          while i < n_columns
-            row[i] = nil if row[i].empty?
-            i += 1
-          end
+          row = parse_no_quote_content(content)
+          @last_line = original_line
+          emit_row(row, &block)
         end
-        @last_line = original_line
-        emit_row(row, &block)
       end
+    end
+
+    def parse_no_quote_content(line)
+      line = strip_value(line)
+      row = line.split(@split_column_separator, -1)
+      if @max_field_size
+        row.each do |column|
+          validate_field_size(column)
+        end
+      end
+      row.each_index do |i|
+        row[i] = nil if row[i].empty?
+      end
+      row
     end
 
     def parse_quotable_loose(&block)
@@ -987,52 +1085,67 @@ class CSV
         original_line = line
         line = line.delete_suffix(@row_separator)
 
-        if line.empty?
-          if @skip_blanks
-            @scanner.keep_drop
-            @scanner.keep_start
-            next
+        begin
+          if @recovery
+            @record_start_pos = @scanner.pos - original_line.bytesize
+            @record_end_pos = @scanner.pos
           end
-          row = []
-          quoted_fields = FieldsConverter::NO_QUOTED_FIELDS
-        elsif line.include?(@cr) or line.include?(@lf)
-          @scanner.keep_back
-          @parse_method = :parse_quotable_robust
-          return parse_quotable_robust(&block)
-        else
-          row = line.split(@split_column_separator, -1)
-          quoted_fields = []
-          n_columns = row.size
-          i = 0
-          while i < n_columns
-            column = row[i]
-            if column.empty?
-              quoted_fields << false
-              row[i] = nil
-            else
-              n_quotes = column.count(@quote_character)
-              if n_quotes.zero?
-                quoted_fields << false
-                # no quote
-              elsif n_quotes == 2 and
-                   column.start_with?(@quote_character) and
-                   column.end_with?(@quote_character)
-                quoted_fields << true
-                row[i] = column[1..-2]
-              else
-                @scanner.keep_back
-                @parse_method = :parse_quotable_robust
-                return parse_quotable_robust(&block)
-              end
-              validate_field_size(row[i])
+          if line.empty?
+            if @skip_blanks
+              @scanner.keep_drop
+              @scanner.keep_start
+              next
             end
-            i += 1
+            row = []
+            quoted_fields = FieldsConverter::NO_QUOTED_FIELDS
+          elsif line.include?(@cr) or line.include?(@lf)
+            @scanner.keep_back
+            @parse_method = :parse_quotable_robust
+            return parse_quotable_robust(&block)
+          else
+            row = line.split(@split_column_separator, -1)
+            quoted_fields = []
+            n_columns = row.size
+            i = 0
+            while i < n_columns
+              column = row[i]
+              if column.empty?
+                quoted_fields << false
+                row[i] = nil
+              else
+                n_quotes = column.count(@quote_character)
+                if n_quotes.zero?
+                  quoted_fields << false
+                  # no quote
+                elsif n_quotes == 2 and
+                      column.start_with?(@quote_character) and
+                      column.end_with?(@quote_character)
+                  quoted_fields << true
+                  row[i] = column[1..-2]
+                else
+                  @scanner.keep_back
+                  @parse_method = :parse_quotable_robust
+                  return parse_quotable_robust(&block)
+                end
+                validate_field_size(row[i])
+              end
+              i += 1
+            end
           end
+          @scanner.keep_drop
+          @scanner.keep_start
+          @last_line = original_line
+          emit_row(row, quoted_fields, &block)
+        rescue RecoverableFieldError => error
+          @scanner.keep_drop
+          @scanner.keep_start
+          @record_start_pos ||= @scanner.pos - original_line.bytesize
+          @record_end_pos = @scanner.pos
+          emit_record_failure(error, :field_error, &block)
+        rescue UnrecoverableFieldError => error
+          emit_record_failure(error, :unrecoverable, &block)
+          return
         end
-        @scanner.keep_drop
-        @scanner.keep_start
-        @last_line = original_line
-        emit_row(row, quoted_fields, &block)
       end
       @scanner.keep_drop
     end
@@ -1042,6 +1155,16 @@ class CSV
       quoted_fields = []
       skip_needless_lines
       start_row
+      if @recovery
+        catch(:stop_recovery) do
+          parse_quotable_robust_recovery(row, quoted_fields, &block)
+        end
+      else
+        parse_quotable_robust_strict(row, quoted_fields, &block)
+      end
+    end
+
+    def parse_quotable_robust_strict(row, quoted_fields, &block)
       while true
         @quoted_column_value = false
         @unquoted_column_value = false
@@ -1073,37 +1196,85 @@ class CSV
           emit_row(row, quoted_fields, &block)
           break
         else
-          if @quoted_column_value
-            if liberal_parsing? and (new_line = @scanner.check(@line_end))
-              message =
-                "Illegal end-of-line sequence outside of a quoted field " +
-                "<#{new_line.inspect}>"
-            else
-              message = "Any value after quoted field isn't allowed"
-            end
-            ignore_broken_line
-            raise MalformedCSVError.new(message, @lineno)
-          elsif @unquoted_column_value and
-                (new_line = @scanner.scan(@line_end))
-            ignore_broken_line
-            message = "Unquoted fields do not allow new line " +
-                      "<#{new_line.inspect}>"
-            raise MalformedCSVError.new(message, @lineno)
-          elsif @scanner.rest.start_with?(@quote_character)
-            ignore_broken_line
-            message = "Illegal quoting"
-            raise MalformedCSVError.new(message, @lineno)
-          elsif (new_line = @scanner.scan(@line_end))
-            ignore_broken_line
-            message = "New line must be <#{@row_separator.inspect}> " +
-                      "not <#{new_line.inspect}>"
-            raise MalformedCSVError.new(message, @lineno)
-          else
-            ignore_broken_line
-            raise MalformedCSVError.new("TODO: Meaningful message",
-                                        @lineno)
-          end
+          strict_field_error
         end
+      end
+    end
+
+    def parse_quotable_robust_recovery(row, quoted_fields, &block)
+      @record_start_pos = scanner_byte_pos
+      while true
+        begin
+          @quoted_column_value = false
+          @unquoted_column_value = false
+          @scanner.scan_all(@strip_value) if @strip_value
+          value = parse_column_value
+          if value
+            @scanner.scan_all(@strip_value) if @strip_value
+            validate_field_size(value)
+          end
+          if parse_column_end
+            row << value
+            quoted_fields << @quoted_column_value
+          elsif parse_row_end
+            if row.empty? and value.nil?
+              emit_row([], &block) unless @skip_blanks
+            else
+              row << value
+              quoted_fields << @quoted_column_value
+              emit_row(row, quoted_fields, &block)
+              row = []
+              quoted_fields.clear
+            end
+            skip_needless_lines
+            start_row
+            @record_start_pos = scanner_byte_pos
+          elsif @scanner.eos?
+            break if row.empty? and value.nil?
+            row << value
+            quoted_fields << @quoted_column_value
+            emit_row(row, quoted_fields, &block)
+            break
+          else
+            strict_field_error
+          end
+        rescue RecoverableFieldError => error
+          row = []
+          quoted_fields.clear
+          break unless handle_record_error(error, :recoverable, &block)
+          skip_needless_lines
+          start_row
+          @record_start_pos = scanner_byte_pos
+        rescue UnrecoverableFieldError => error
+          handle_record_error(error, :unrecoverable, &block)
+          break
+        end
+      end
+    end
+
+    def strict_field_error
+      if @quoted_column_value
+        if liberal_parsing? and (new_line = @scanner.check(@line_end))
+          message =
+            "Illegal end-of-line sequence outside of a quoted field " +
+            "<#{new_line.inspect}>"
+        else
+          message = "Any value after quoted field isn't allowed"
+        end
+        field_error!(:recoverable, message)
+      elsif @unquoted_column_value and
+            (new_line = @scanner.scan(@line_end))
+        message = "Unquoted fields do not allow new line " +
+                  "<#{new_line.inspect}>"
+        field_error!(:unrecoverable, message)
+      elsif @scanner.rest.start_with?(@quote_character)
+        field_error!(:recoverable, "Illegal quoting")
+      elsif (new_line = @scanner.scan(@line_end))
+        message = "New line must be <#{@row_separator.inspect}> " +
+                  "not <#{new_line.inspect}>"
+        field_error!(:unrecoverable, message)
+      else
+        field_error!(:unrecoverable, "TODO: Meaningful message")
       end
     end
 
@@ -1191,9 +1362,8 @@ class CSV
 
           quotes = @scanner.scan_all(@quotes)
           unless quotes
-            ignore_broken_line
             message = "Unclosed quoted field"
-            raise MalformedCSVError.new(message, @lineno)
+            field_error!(:unrecoverable, message)
           end
           n_quotes = quotes.size
           if n_quotes == 1
@@ -1271,11 +1441,45 @@ class CSV
       @lineno += 1
 
       raw_row = row
+      if @recovery and header_row?
+        # A bad header record leaves the whole stream ambiguous: report it
+        # as unrecoverable and stop.
+        begin
+          converted = convert_row(row, raw_row, quoted_fields)
+        rescue StandardError => error
+          emit_record_failure(error, :unrecoverable, &block)
+          return
+        end
+        block.call(converted) unless converted == HEADER_CONSUMED
+      elsif @recovery
+        # A converter error only affects this record. The record boundary
+        # was already parsed, so no resynchronization is needed and earlier
+        # records are never converted again.
+        begin
+          converted = convert_row(row, raw_row, quoted_fields)
+        rescue StandardError => error
+          emit_record_failure(error, :converter_error, &block)
+          return
+        end
+        block.call(converted) unless converted == HEADER_CONSUMED
+      else
+        converted = convert_row(row, raw_row, quoted_fields)
+        block.call(converted) unless converted == HEADER_CONSUMED
+      end
+    end
+
+    def convert_row(row, raw_row, quoted_fields)
       if @use_headers
         if @headers.nil?
           @headers = adjust_headers(row, quoted_fields)
-          return unless @return_headers
-          row = Row.new(@headers, row, true)
+          if @return_headers
+            header_row = Row.new(@headers, row, true)
+            if @unconverted_fields and not header_row.respond_to?(:unconverted_fields)
+              add_unconverted_fields(header_row, row)
+            end
+            return header_row
+          end
+          return HEADER_CONSUMED
         else
           row = Row.new(@headers,
                         @fields_converter.convert(raw_row, @headers, @lineno, quoted_fields))
@@ -1289,8 +1493,195 @@ class CSV
       if @unconverted_fields and not row.respond_to?(:unconverted_fields)
         add_unconverted_fields(row, raw_row)
       end
+      row
+    end
 
-      yield(row)
+    # Raises the internal field error used by recovery mode. When recovery is
+    # disabled the legacy behavior (skip to the next physical line and raise a
+    # CSV::MalformedCSVError) is preserved.
+    def field_error!(kind, message)
+      if @recovery
+        if kind == :recoverable
+          raise RecoverableFieldError.new(message)
+        else
+          raise UnrecoverableFieldError.new(message)
+        end
+      end
+      ignore_broken_line
+      raise MalformedCSVError.new(message, @lineno)
+    end
+
+    # Handles a malformed record in recovery mode. Returns +true+ when a
+    # boundary was found and parsing can continue, +false+ when the failure
+    # was unrecoverable and the caller must stop.
+    def handle_record_error(error, kind, &block)
+      boundary = resynchronize_record
+      if boundary == :found
+        emit_record_failure(error, :field_error, &block)
+        true
+      else
+        emit_record_failure(error,
+                            boundary == :budget ? :scan_budget_exceeded : :unclosed,
+                            &block)
+        false
+      end
+    end
+
+    # Re-scans from the start of the bad record in a quote-aware way to find
+    # the next reliable record boundary. Never uses a bare physical newline
+    # because it may live inside a legitimate quoted field.
+    #
+    # Returns:
+    # - +:found+ when a row separator was seen outside of quotes,
+    # - +:unclosed+ when the input ended inside a quoted field,
+    # - +:budget+ when more than +:recovery_scan_budget+ bytes were scanned
+    #   without finding a reliable boundary.
+    def resynchronize_record
+      return :unclosed unless @scanner.respond_to?(:pos=)
+
+      start_pos = @record_start_pos || 0
+      @scanner.clear_keeps
+      @scanner.pos = start_pos
+
+      quote_bytes = @quote_character ? @quote_character.b : nil
+      row_bytes = @row_separator.b
+      scanned = 0
+      result = :unclosed
+      quote_buf = +"".b
+      row_buf = +"".b
+      in_quotes = false
+      while true
+        if scanned >= @recovery_scan_budget
+          result = :budget
+          break
+        end
+        if @scanner.eos?
+          result = in_quotes ? :unclosed : :found
+          break
+        end
+        character = @scanner.get_byte
+        scanned += 1
+        next unless character
+
+        if in_quotes
+          # Quotes toggle state, so doubled quotes ("") stay balanced.
+          if quote_bytes
+            quote_buf << character.b
+            if quote_bytes.start_with?(quote_buf)
+              if quote_buf == quote_bytes
+                in_quotes = false
+                quote_buf.clear
+              end
+            else
+              quote_buf.clear
+            end
+          end
+        elsif quote_bytes && consume_token(quote_bytes, character, quote_buf)
+          in_quotes = true
+          row_buf.clear
+        elsif consume_token(row_bytes, character, row_buf)
+          result = :found
+          break
+        end
+      end
+      @record_end_pos = @scanner.pos
+      result
+    end
+
+    # Accumulates bytes into +buffer+ to recognize a fixed byte +token+.
+    # Returns +true+ exactly when +byte+ completes the token.
+    def consume_token(token, byte, buffer)
+      byte = byte.b
+      if buffer.empty?
+        return false unless token.start_with?(byte)
+        buffer << byte
+      else
+        buffer << byte
+        buffer.clear unless token.start_with?(buffer)
+      end
+      return false unless buffer == token
+
+      buffer.clear
+      true
+    end
+
+    def emit_encoding_failure(cause, &block)
+      @lineno += 1
+      start_pos = @record_start_pos
+      end_pos = scanner_byte_pos
+      record = build_failure_record(cause,
+                                    start_pos,
+                                    end_pos,
+                                    end_pos - (start_pos || end_pos),
+                                    true)
+      yield(record)
+    end
+
+    def emit_encoding_failure_from_string(&block)
+      string = @encoding_failure_string
+      index = @encoding_failure_index || 0
+      start_pos = 0
+      index.times do
+        separator_pos = string.index(@row_separator, start_pos)
+        break unless separator_pos
+        start_pos = separator_pos + @row_separator.bytesize
+      end
+      end_pos = string.bytesize
+      lineno = @lineno + index + 1
+      @lineno = lineno
+      cause = InvalidEncodingError.new(@encoding, lineno)
+      limit = @max_retained_bytes
+      retained_size = [end_pos - start_pos, limit].min
+      raw = string.byteslice(start_pos, retained_size)
+      failure = UnrecoverableRecord.new(lineno,
+                                        [start_pos, end_pos],
+                                        cause,
+                                        raw,
+                                        end_pos - start_pos,
+                                        (end_pos - start_pos) > retained_size)
+      yield(failure)
+    end
+
+    def emit_record_failure(cause, reason, &block)
+      @lineno += 1
+      start_pos = @record_start_pos
+      end_pos = @record_end_pos || scanner_byte_pos
+      byte_size = end_pos - (start_pos || end_pos)
+      unrecoverable = reason != :field_error && reason != :converter_error
+      record = build_failure_record(cause,
+                                    start_pos,
+                                    end_pos,
+                                    byte_size,
+                                    unrecoverable)
+      @record_end_pos = nil
+      yield(record)
+      throw :stop_recovery if unrecoverable
+    end
+
+    def build_failure_record(cause, start_pos, end_pos, byte_size, unrecoverable)
+      start_pos ||= 0
+      end_pos ||= start_pos
+      byte_size = [byte_size, end_pos - start_pos].max
+      limit = @max_retained_bytes
+      retained_size = [[byte_size, 0].max, limit].min
+      raw = input_bytes&.byteslice(start_pos, retained_size)
+      truncated = byte_size > retained_size
+      error = cause.is_a?(MalformedCSVError) ? cause : MalformedCSVError.new(cause.message, @lineno)
+      klass = unrecoverable ? UnrecoverableRecord : MalformedRecord
+      klass.new(@lineno,
+                [start_pos, end_pos],
+                error,
+                raw,
+                byte_size,
+                truncated)
+    end
+
+    def scanner_byte_pos
+      @scanner.respond_to?(:pos) ? @scanner.pos : 0
+    end
+
+    def input_bytes
+      @scanner.respond_to?(:string) ? @scanner.string : nil
     end
 
     # This method injects an instance variable <tt>unconverted_fields</tt> into

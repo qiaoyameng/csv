@@ -392,6 +392,8 @@ require_relative "csv/writer"
 #
 # :include: ../doc/csv/options/parsing/liberal_parsing.rdoc
 #
+# :include: ../doc/csv/options/parsing/recovery.rdoc
+#
 # :include: ../doc/csv/options/parsing/nil_value.rdoc
 #
 # :include: ../doc/csv/options/parsing/empty_value.rdoc
@@ -867,6 +869,99 @@ class CSV
     end
   end
 
+  # Result yielded for a record that couldn't be parsed when parsing with
+  # <tt>recovery: true</tt> (CSV.parse with the +:recovery+ option).
+  #
+  # A failure item preserves the original bytes of the bad record for manual
+  # inspection and reports where the record lived in the input:
+  #
+  # - CSV::MalformedRecord#lineno is the 1-based logical record number
+  #   (multiline quoted fields count as a single record).
+  # - CSV::MalformedRecord#byte_range is a two-element \Array of
+  #   <tt>[start, exclusive_end]</tt> byte offsets into the original input.
+  # - CSV::MalformedRecord#error is the underlying CSV::MalformedCSVError
+  #   with the reason why the record was rejected.
+  # - CSV::MalformedRecord#raw is the retained original bytes. It is capped
+  #   by the +:max_retained_bytes+ recovery option; CSV::MalformedRecord#truncated?
+  #   is +true+ and CSV::MalformedRecord#raw_bytesize reports the original
+  #   record size when the retained bytes were cut.
+  #
+  # Recoverable failures do not stop parsing: the parser scans for the next
+  # record boundary in a quote-aware way and keeps going.
+  class MalformedRecord
+    # Creates a new failure item.
+    def initialize(lineno, byte_range, error, raw, raw_bytesize, truncated)
+      @lineno = lineno
+      @byte_range = byte_range
+      @error = error
+      @raw = raw
+      @raw_bytesize = raw_bytesize
+      @truncated = truncated
+    end
+
+    # The 1-based logical record number of the bad record.
+    attr_reader :lineno
+
+    # <tt>[start_byte, exclusive_end_byte]</tt> offsets into the input.
+    # +nil+ offsets mean the position couldn't be determined.
+    attr_reader :byte_range
+
+    # The underlying CSV::MalformedCSVError describing the failure reason.
+    attr_reader :error
+
+    # The retained original bytes of the bad record.
+    attr_reader :raw
+
+    # The byte size of the complete original bad record, before truncation.
+    attr_reader :raw_bytesize
+
+    # Always +false+ for a recoverable failure; overridden by
+    # CSV::UnrecoverableRecord.
+    def recoverable?
+      true
+    end
+
+    # +true+ only for CSV::UnrecoverableRecord.
+    def unrecoverable?
+      !recoverable?
+    end
+
+    # +true+ when the parser kept reading records after this failure.
+    def failure?
+      true
+    end
+
+    # +true+ when the retained #raw bytes were capped.
+    def truncated?
+      @truncated
+    end
+
+    # Start byte offset of the bad record, or +nil+ if unknown.
+    def start_byte
+      @byte_range&.first
+    end
+
+    # Exclusive end byte offset of the bad record, or +nil+ if unknown.
+    def end_byte
+      @byte_range&.last
+    end
+
+    def inspect
+      "#<#{self.class} lineno:#{@lineno} byte_range:#{@byte_range.inspect} " \
+        "error:#{@error.message.inspect} truncated:#{@truncated}>"
+    end
+  end
+
+  # A CSV::MalformedRecord whose boundary could not be determined reliably
+  # (an unclosed quoted field, a boundary search that exceeded the scan
+  # budget, or invalid encoding). Recovery stops after this item is yielded:
+  # no further records are read.
+  class UnrecoverableRecord < MalformedRecord
+    def recoverable?
+      false
+    end
+  end
+
   #
   # A FieldInfo Struct contains details about a field's position in the data
   # source it was read from.  CSV will pass this Struct to some blocks that make
@@ -970,6 +1065,9 @@ class CSV
     nil_value:          nil,
     empty_value:        "",
     strip:              false,
+    recovery:           false,
+    max_retained_bytes: 65_536,
+    recovery_scan_budget: 1_048_576,
     # For generating.
     write_headers:      nil,
     quote_empty:        true,
@@ -2053,6 +2151,9 @@ class CSV
                  nil_value: nil,
                  empty_value: "",
                  strip: false,
+                 recovery: false,
+                 max_retained_bytes: DEFAULT_OPTIONS.fetch(:max_retained_bytes),
+                 recovery_scan_budget: DEFAULT_OPTIONS.fetch(:recovery_scan_budget),
                  quote_empty: true,
                  write_converters: nil,
                  write_nil_value: nil,
@@ -2108,6 +2209,9 @@ class CSV
       nil_value: nil_value,
       empty_value: empty_value,
       strip: strip,
+      recovery: recovery,
+      max_retained_bytes: max_retained_bytes,
+      recovery_scan_budget: recovery_scan_budget,
     }
     @parser = nil
 

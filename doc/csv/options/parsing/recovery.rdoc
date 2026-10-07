@@ -1,0 +1,53 @@
+====== Option +recovery+
+
+Specifies whether the parser keeps bad records for manual inspection
+instead of raising CSV::MalformedCSVError.
+
+When +true+, each successful record is yielded as an \Array (or CSV::Row
+when headers are used). Each bad record is yielded as a
+CSV::MalformedRecord (or CSV::UnrecoverableRecord) that carries:
+
+- CSV::MalformedRecord#lineno: the 1-based logical record number
+  (a multiline quoted field is a single record);
+- CSV::MalformedRecord#byte_range: <tt>[start_byte, exclusive_end_byte]</tt>
+  byte offsets into the original input;
+- CSV::MalformedRecord#error: the underlying CSV::MalformedCSVError;
+- CSV::MalformedRecord#raw: the retained original bytes.
+
+A field error is recoverable when the end of the record can still be
+determined: the parser re-scans the bytes in a quote-aware way (a newline
+inside a quoted field is never treated as a boundary) and continues with
+the next record. An unclosed quoted field, a boundary search that exceeds
++:recovery_scan_budget+, or invalid encoding is yielded as
+CSV::UnrecoverableRecord and stops parsing.
+
+A converter that raises only affects the record being converted; records
+already converted are not converted again.
+
+Retained raw bytes are capped by +:max_retained_bytes+. When capped,
+CSV::MalformedRecord#truncated? is +true+ and
+CSV::MalformedRecord#raw_bytesize gives the uncapped size.
+
+Default value:
+  CSV::DEFAULT_OPTIONS.fetch(:recovery) # => false
+  CSV::DEFAULT_OPTIONS.fetch(:max_retained_bytes) # => 65536
+  CSV::DEFAULT_OPTIONS.fetch(:recovery_scan_budget) # => 1048576
+
+Example:
+  str = "1,ok\n2,\"q\"bad\n3,fine\n"
+  CSV.parse(str, recovery: true) do |record|
+    if record.is_a?(CSV::MalformedRecord)
+      record.lineno       # => 2
+      record.byte_range   # => [5, 15]
+      record.raw          # => "2,\"q\"bad\n"
+      record.recoverable? # => true
+    else
+      record             # => successful rows ["1", "ok"], ["3", "fine"]
+    end
+  end
+
+An unclosed quoted field is unrecoverable:
+  str = "1,ok\n2,\"unclosed"
+  CSV.parse(str, recovery: true) do |record|
+    record.is_a?(CSV::UnrecoverableRecord) # => true for the final record
+  end
