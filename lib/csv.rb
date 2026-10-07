@@ -100,6 +100,7 @@ require_relative "csv/parser"
 require_relative "csv/row"
 require_relative "csv/table"
 require_relative "csv/writer"
+require_relative "csv/sniffer"
 
 # == \CSV
 #
@@ -980,6 +981,70 @@ class CSV
   }.freeze
 
   class << self
+    # :call-seq:
+    #   CSV.sniff(string_or_io, **options) { |result| ... } -> result
+    #
+    # Bounded, evidence based dialect detection. Instead of always guessing a
+    # single delimiter, the caller supplies the candidate column separators,
+    # quote characters and record separators to consider. Each combination is
+    # evaluated by parsing no more than +sample_bytes+ bytes with the real CSV
+    # parser; the returned CSV::Sniffing::SniffResult ranks the candidates and
+    # records the evidence for each.
+    #
+    # When the top candidates tie and cannot be distinguished, the result is
+    # marked ambiguous and CSV::Sniffing::SniffResult#decision returns +nil+;
+    # the caller keeps the choice rather than being forced onto a delimiter.
+    #
+    # Options:
+    # - +col_seps+/:column_separators+ - candidate column separators
+    #   (default: <tt>[",", ";", "\t", "|", ":"]</tt>).
+    # - +quote_chars+/:quote_characters+ - candidate quote characters
+    #   (default: <tt>['"', "'"]</tt>).
+    # - +row_seps+/:row_separators+ - candidate record separators; +:auto+
+    #   resolves to <tt>"\r\n"</tt>, <tt>"\r"</tt> or <tt>"\n"</tt>.
+    # - +sample_bytes+ - maximum bytes read for sniffing (default 65536).
+    # - +encoding+ - encoding used while parsing the sample.
+    # - +skip_lines+, +liberal_parsing+, +strip+ are forwarded to the parser
+    #   used both for sniffing and for the returned reader.
+    #
+    # For a non seekable IO, the bytes consumed for sniffing are replayed:
+    # +result.reader+ (or +result.parse+) yields a reader over the whole input
+    # without losing the head or re-reading those bytes from the source.
+    #
+    #   result = CSV.sniff(io, col_seps: [",", ";", "\t"])
+    #   if result.ambiguous?
+    #     # let the caller choose, e.g. result.parse(col_sep: ";")
+    #   else
+    #     result.reader.read
+    #   end
+    def sniff(string_or_io = nil,
+              col_seps: nil,
+              column_separators: nil,
+              quote_chars: nil,
+              quote_characters: nil,
+              row_seps: nil,
+              row_separators: nil,
+              sample_bytes: nil,
+              encoding: nil,
+              **parse_options,
+              &block)
+      column_separators ||= col_seps
+      quote_characters ||= quote_chars
+      row_separators ||= row_seps
+      sniffer = Sniffing::Sniffer.new(
+        string_or_io,
+        column_separators: column_separators,
+        quote_characters: quote_characters,
+        row_separators: row_separators,
+        sample_bytes: sample_bytes,
+        encoding: encoding,
+        **parse_options
+      )
+      result = sniffer.sniff
+      yield(result) if block
+      result
+    end
+
     # :call-seq:
     #   instance(string, **options)
     #   instance(io = $stdout, **options)

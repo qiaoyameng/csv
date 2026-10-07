@@ -1,5 +1,17 @@
 # News
 
+## Unreleased
+
+### Additions
+
+  * Added `CSV.sniff`, a bounded, evidence based dialect detector. The caller
+    supplies candidate column separators, quote characters and record
+    separators; up to `sample_bytes` bytes are parsed with the real parser for
+    each combination, returning ranked candidates with evidence. Ties and
+    single-column/empty/comment-only input are reported as ambiguity instead of
+    forcing a separator. For non seekable IO, the consumed sample is replayed
+    by the returned reader so the head is neither lost nor read twice.
+
 ## 3.3.6 - 2026-07-27
 
 ### Improvements
